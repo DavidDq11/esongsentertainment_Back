@@ -24,12 +24,23 @@ const router = Router()
 // Upload report (admin only)
 router.post('/', requireAdmin, upload.single('file'), async (req, res, next) => {
   try {
-    const { sello_id, tipo, trimestre, anio, total_regalias } = req.body
+    const { sello_id, tipo, trimestre, anio } = req.body
     if (!req.file || !sello_id || !tipo || !trimestre || !anio) {
       return res.status(400).json({ error: 'file, sello_id, tipo, trimestre, anio are required' })
     }
     if (!['streaming', 'youtube'].includes(tipo)) {
       return res.status(400).json({ error: 'tipo must be streaming or youtube' })
+    }
+
+    // Check storage limit (8 GB)
+    const LIMIT_BYTES = 6 * 1024 * 1024 * 1024
+    const usedRes = await pool.query('SELECT COALESCE(SUM(file_size), 0) AS used FROM reportes')
+    const usedBytes = parseInt(usedRes.rows[0].used)
+    if (usedBytes + req.file.size > LIMIT_BYTES) {
+      const usedGB = (usedBytes / (1024 ** 3)).toFixed(2)
+      return res.status(507).json({
+        error: `Storage limit reached. Used: ${usedGB} GB of 8 GB.`,
+      })
     }
 
     const r2Key = `reportes/${sello_id}/${tipo}/${anio}-Q${trimestre}-${Date.now()}.xlsx`
@@ -43,23 +54,73 @@ router.post('/', requireAdmin, upload.single('file'), async (req, res, next) => 
       ContentDisposition: `attachment; filename="${req.file.originalname}"`,
     }))
 
-    // Parse top songs from Excel (best-effort)
+    // Parse Excel: calculate total_regalias and top 10 songs
     let topSongs = []
+    let totalReg = 0
     try {
       const wb = XLSX.read(req.file.buffer, { type: 'buffer' })
       const ws = wb.Sheets[wb.SheetNames[0]]
       const data = XLSX.utils.sheet_to_json(ws)
-      topSongs = data.slice(0, 10).map((row, i) => ({
-        posicion: i + 1,
-        titulo: String(row.titulo ?? row.title ?? row.Titulo ?? row.Title ?? row.TITLE ?? `Track ${i + 1}`),
-        artista: String(row.artista ?? row.artist ?? row.Artista ?? row.Artist ?? ''),
-        isrc: row.isrc ?? row.ISRC ?? null,
-        reproducciones: parseInt(row.reproducciones ?? row.streams ?? row.Streams ?? row.plays ?? 0) || 0,
-        regalias: parseFloat(row.regalias ?? row.royalties ?? row.Royalties ?? 0) || 0,
-      }))
-    } catch { /* non-standard format — skip top songs */ }
 
-    const totalReg = parseFloat(total_regalias) || 0
+      // Normalize column names: trim surrounding spaces
+      const normalized = data.map(row =>
+        Object.fromEntries(Object.entries(row).map(([k, v]) => [k.trim(), v]))
+      )
+
+      console.log('[Excel] tipo:', tipo)
+      console.log('[Excel] total filas:', normalized.length)
+      console.log('[Excel] columnas normalizadas:', normalized.length > 0 ? Object.keys(normalized[0]) : 'sin datos')
+      console.log('[Excel] primera fila normalizada:', normalized[0])
+
+      if (tipo === 'streaming') {
+        // Streaming: reporting_month/label/isrc/song_title/artist/streams/total_earned_usd
+        const map = new Map()
+        for (const row of normalized) {
+          const earnings = parseFloat(row['total_earned_usd'] ?? row['total_earned'] ?? 0) || 0
+          totalReg += earnings
+          const isrc    = String(row['isrc'] ?? row['ISRC'] ?? '')
+          const titulo  = String(row['song_title'] ?? row['title'] ?? 'Track')
+          const artista = String(row['artist'] ?? '')
+          const key     = isrc || titulo
+          if (!map.has(key)) {
+            map.set(key, { titulo, artista, isrc: isrc || null, reproducciones: 0, regalias: 0 })
+          }
+          const entry = map.get(key)
+          entry.reproducciones += parseInt(row['streams'] ?? 0) || 0
+          entry.regalias       += earnings
+        }
+        topSongs = [...map.values()]
+          .sort((a, b) => b.regalias - a.regalias)
+          .slice(0, 10)
+          .map((s, i) => ({ ...s, posicion: i + 1 }))
+
+      } else {
+        // YouTube Content ID: Asset Title/ISRC/Artist/Total Net Earnings/AD Total Views
+        const map = new Map()
+        for (const row of normalized) {
+          const earnings = parseFloat(row['Total Net Earnings'] ?? 0) || 0
+          totalReg += earnings
+          const isrc    = String(row['ISRC'] ?? row['Custom ID'] ?? '')
+          const titulo  = String(row['Asset Title'] ?? row['title'] ?? 'Track')
+          const artista = String(row['Artist'] ?? '')
+          const key     = isrc || titulo
+          if (!map.has(key)) {
+            map.set(key, { titulo, artista, isrc: isrc || null, reproducciones: 0, regalias: 0 })
+          }
+          const entry = map.get(key)
+          entry.reproducciones += parseInt(row['AD Total Views'] ?? 0) || 0
+          entry.regalias       += earnings
+        }
+        topSongs = [...map.values()]
+          .sort((a, b) => b.regalias - a.regalias)
+          .slice(0, 10)
+          .map((s, i) => ({ ...s, posicion: i + 1 }))
+      }
+
+      totalReg = Math.round(totalReg * 100) / 100
+      console.log('[Excel] totalReg calculado:', totalReg)
+      console.log('[Excel] top canciones:', topSongs)
+    } catch { /* non-standard format — skip parsing */ }
 
     const client = await pool.connect()
     try {
@@ -67,15 +128,16 @@ router.post('/', requireAdmin, upload.single('file'), async (req, res, next) => 
 
       // Upsert reporte (one per sello+tipo+trimestre+anio)
       const rep = await client.query(
-        `INSERT INTO reportes (sello_id, tipo, nombre_archivo, r2_key, trimestre, anio, total_regalias)
-         VALUES ($1,$2,$3,$4,$5,$6,$7)
+        `INSERT INTO reportes (sello_id, tipo, nombre_archivo, r2_key, trimestre, anio, total_regalias, file_size)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
          ON CONFLICT (sello_id, tipo, trimestre, anio) DO UPDATE
            SET nombre_archivo = EXCLUDED.nombre_archivo,
                r2_key         = EXCLUDED.r2_key,
                total_regalias = EXCLUDED.total_regalias,
+               file_size      = EXCLUDED.file_size,
                created_at     = NOW()
          RETURNING *`,
-        [sello_id, tipo, req.file.originalname, r2Key, trimestre, anio, totalReg]
+        [sello_id, tipo, req.file.originalname, r2Key, trimestre, anio, totalReg, req.file.size]
       )
       const repId = rep.rows[0].id
 
