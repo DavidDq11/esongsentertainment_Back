@@ -1,6 +1,8 @@
 import { Router } from 'express'
 import bcrypt from 'bcryptjs'
+import { DeleteObjectCommand } from '@aws-sdk/client-s3'
 import pool from '../config/db.js'
+import { r2, R2_BUCKET } from '../config/r2.js'
 import { requireAdmin } from '../middleware/auth.js'
 
 const router = Router()
@@ -31,6 +33,9 @@ router.post('/', requireAdmin, async (req, res, next) => {
     const { nombre, representante, email, password, pais, telefono, iniciales } = req.body
     if (!nombre || !email || !password) {
       return res.status(400).json({ error: 'nombre, email, and password are required' })
+    }
+    if (iniciales && iniciales.length > 20) {
+      return res.status(400).json({ error: 'iniciales must be 20 characters or less' })
     }
     const hash = await bcrypt.hash(password, 10)
     const result = await pool.query(
@@ -80,10 +85,46 @@ router.put('/:id', requireAdmin, async (req, res, next) => {
   }
 })
 
-// Deactivate sello
+// Toggle estado (activo / inactivo)
+router.patch('/:id/estado', requireAdmin, async (req, res, next) => {
+  try {
+    const { estado } = req.body
+    if (!['activo', 'inactivo'].includes(estado)) {
+      return res.status(400).json({ error: 'estado must be activo or inactivo' })
+    }
+    const result = await pool.query(
+      `UPDATE sellos SET estado = $1 WHERE id = $2
+       RETURNING id, nombre, representante, email, pais, telefono, iniciales, estado`,
+      [estado, req.params.id]
+    )
+    if (!result.rows.length) return res.status(404).json({ error: 'Not found' })
+    res.json(result.rows[0])
+  } catch (err) {
+    next(err)
+  }
+})
+
+// Hard delete sello (removes row + cascades reportes/resumen/top_canciones + cleans R2 files)
 router.delete('/:id', requireAdmin, async (req, res, next) => {
   try {
-    await pool.query("UPDATE sellos SET estado = 'inactivo' WHERE id = $1", [req.params.id])
+    // Collect R2 keys before cascade delete
+    const repsRes = await pool.query(
+      'SELECT r2_key FROM reportes WHERE sello_id = $1',
+      [req.params.id]
+    )
+
+    // Delete the sello (CASCADE handles DB children)
+    const del = await pool.query(
+      'DELETE FROM sellos WHERE id = $1 RETURNING id',
+      [req.params.id]
+    )
+    if (!del.rows.length) return res.status(404).json({ error: 'Not found' })
+
+    // Clean up R2 files in background (non-blocking)
+    for (const { r2_key } of repsRes.rows) {
+      r2.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: r2_key })).catch(() => {})
+    }
+
     res.json({ ok: true })
   } catch (err) {
     next(err)

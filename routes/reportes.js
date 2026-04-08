@@ -1,4 +1,5 @@
 import { Router } from 'express'
+import { createHash } from 'crypto'
 import multer from 'multer'
 import { PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3'
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
@@ -19,10 +20,53 @@ const upload = multer({
   },
 })
 
+// Simple in-memory rate limiter for uploads (20 per hour per admin)
+const uploadAttempts = new Map()
+const RATE_WINDOW_MS  = 60 * 60 * 1000 // 1 hour
+const RATE_LIMIT_MAX  = 20
+
+function uploadRateLimit(req, res, next) {
+  const key = req.user?.id || req.ip
+  const now = Date.now()
+  let record = uploadAttempts.get(key)
+  if (!record || now > record.resetAt) {
+    record = { count: 0, resetAt: now + RATE_WINDOW_MS }
+  }
+  record.count++
+  uploadAttempts.set(key, record)
+  if (record.count > RATE_LIMIT_MAX) {
+    return res.status(429).json({ error: 'Too many upload attempts. Please try again in an hour.' })
+  }
+  next()
+}
+
+const LIMIT_BYTES = 8 * 1024 * 1024 * 1024 // 8 GB
+
 const router = Router()
 
+// Storage usage (admin only) — must be before /:id routes
+router.get('/storage', requireAdmin, async (_req, res, next) => {
+  try {
+    const result = await pool.query(
+      'SELECT COALESCE(SUM(file_size), 0) AS used, COUNT(*) AS total_files FROM reportes'
+    )
+    const usedBytes  = parseInt(result.rows[0].used)
+    const totalFiles = parseInt(result.rows[0].total_files)
+    res.json({
+      used_bytes:  usedBytes,
+      limit_bytes: LIMIT_BYTES,
+      used_gb:     (usedBytes / (1024 ** 3)).toFixed(3),
+      limit_gb:    8,
+      pct:         Math.min(Math.round((usedBytes / LIMIT_BYTES) * 100), 100),
+      total_files: totalFiles,
+    })
+  } catch (err) {
+    next(err)
+  }
+})
+
 // Upload report (admin only)
-router.post('/', requireAdmin, upload.single('file'), async (req, res, next) => {
+router.post('/', requireAdmin, uploadRateLimit, upload.single('file'), async (req, res, next) => {
   try {
     const { sello_id, tipo, trimestre, anio } = req.body
     if (!req.file || !sello_id || !tipo || !trimestre || !anio) {
@@ -32,31 +76,43 @@ router.post('/', requireAdmin, upload.single('file'), async (req, res, next) => 
       return res.status(400).json({ error: 'tipo must be streaming or youtube' })
     }
 
+    // Validate magic bytes: XLSX files are ZIP archives starting with PK\x03\x04
+    const buf = req.file.buffer
+    if (buf[0] !== 0x50 || buf[1] !== 0x4B || buf[2] !== 0x03 || buf[3] !== 0x04) {
+      return res.status(400).json({ error: 'Invalid file. The file is not a valid .xlsx document.' })
+    }
+
+    // Check for duplicate file by content hash
+    const fileHash = createHash('sha256').update(buf).digest('hex')
+    const dupCheck = await pool.query(
+      `SELECT r.id, r.tipo, r.trimestre, r.anio, s.nombre AS sello_nombre
+       FROM reportes r JOIN sellos s ON s.id = r.sello_id
+       WHERE r.file_hash = $1`,
+      [fileHash]
+    )
+    if (dupCheck.rows.length) {
+      const dup = dupCheck.rows[0]
+      return res.status(409).json({
+        error: `Este archivo ya fue subido anteriormente (${dup.sello_nombre} · ${dup.tipo} · Q${dup.trimestre} ${dup.anio}).`,
+        duplicado: { id: dup.id, tipo: dup.tipo, trimestre: dup.trimestre, anio: dup.anio, sello: dup.sello_nombre },
+      })
+    }
+
     // Check storage limit (8 GB)
-    const LIMIT_BYTES = 6 * 1024 * 1024 * 1024
-    const usedRes = await pool.query('SELECT COALESCE(SUM(file_size), 0) AS used FROM reportes')
+    const usedRes  = await pool.query('SELECT COALESCE(SUM(file_size), 0) AS used FROM reportes')
     const usedBytes = parseInt(usedRes.rows[0].used)
     if (usedBytes + req.file.size > LIMIT_BYTES) {
       const usedGB = (usedBytes / (1024 ** 3)).toFixed(2)
       return res.status(507).json({
-        error: `Storage limit reached. Used: ${usedGB} GB of 8 GB.`,
+        error: `Storage limit reached. Used: ${usedGB} GB of 8 GB. Delete old reports before uploading.`,
       })
     }
 
-    const r2Key = `reportes/${sello_id}/${tipo}/${anio}-Q${trimestre}-${Date.now()}.xlsx`
-
-    // Upload to R2
-    await r2.send(new PutObjectCommand({
-      Bucket: R2_BUCKET,
-      Key: r2Key,
-      Body: req.file.buffer,
-      ContentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-      ContentDisposition: `attachment; filename="${req.file.originalname}"`,
-    }))
-
-    // Parse Excel: calculate total_regalias and top 10 songs
+    // Parse Excel FIRST to detect real type before uploading to R2
     let topSongs = []
     let totalReg = 0
+    let tipoFinal = tipo
+    let tipoCorregido = false
     try {
       const wb = XLSX.read(req.file.buffer, { type: 'buffer' })
       const ws = wb.Sheets[wb.SheetNames[0]]
@@ -67,12 +123,23 @@ router.post('/', requireAdmin, upload.single('file'), async (req, res, next) => 
         Object.fromEntries(Object.entries(row).map(([k, v]) => [k.trim(), v]))
       )
 
-      console.log('[Excel] tipo:', tipo)
+      console.log('[Excel] tipo enviado:', tipo)
       console.log('[Excel] total filas:', normalized.length)
       console.log('[Excel] columnas normalizadas:', normalized.length > 0 ? Object.keys(normalized[0]) : 'sin datos')
-      console.log('[Excel] primera fila normalizada:', normalized[0])
 
-      if (tipo === 'streaming') {
+      // Auto-detect real file type by column names
+      const cols = normalized.length > 0 ? Object.keys(normalized[0]).map(c => c.toLowerCase()) : []
+      const looksStreaming = cols.some(c => ['total_earned_usd', 'total_earned', 'streams', 'song_title'].includes(c))
+      const looksYoutube   = cols.some(c => ['total net earnings', 'ad total views', 'asset title'].includes(c))
+      const detectedTipo   = looksYoutube ? 'youtube' : looksStreaming ? 'streaming' : null
+
+      if (detectedTipo && detectedTipo !== tipo) {
+        tipoFinal = detectedTipo
+        tipoCorregido = true
+        console.log(`[Excel] tipo corregido automáticamente: ${tipo} → ${tipoFinal}`)
+      }
+
+      if (tipoFinal === 'streaming') {
         // Streaming: reporting_month/label/isrc/song_title/artist/streams/total_earned_usd
         const map = new Map()
         for (const row of normalized) {
@@ -122,22 +189,33 @@ router.post('/', requireAdmin, upload.single('file'), async (req, res, next) => 
       console.log('[Excel] top canciones:', topSongs)
     } catch { /* non-standard format — skip parsing */ }
 
+    // Upload to R2 using the (possibly corrected) tipo
+    const r2Key = `reportes/${sello_id}/${tipoFinal}/${anio}-Q${trimestre}-${Date.now()}.xlsx`
+    await r2.send(new PutObjectCommand({
+      Bucket: R2_BUCKET,
+      Key: r2Key,
+      Body: req.file.buffer,
+      ContentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      ContentDisposition: `attachment; filename="${req.file.originalname}"`,
+    }))
+
     const client = await pool.connect()
     try {
       await client.query('BEGIN')
 
       // Upsert reporte (one per sello+tipo+trimestre+anio)
       const rep = await client.query(
-        `INSERT INTO reportes (sello_id, tipo, nombre_archivo, r2_key, trimestre, anio, total_regalias, file_size)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        `INSERT INTO reportes (sello_id, tipo, nombre_archivo, r2_key, trimestre, anio, total_regalias, file_size, file_hash)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
          ON CONFLICT (sello_id, tipo, trimestre, anio) DO UPDATE
            SET nombre_archivo = EXCLUDED.nombre_archivo,
                r2_key         = EXCLUDED.r2_key,
                total_regalias = EXCLUDED.total_regalias,
                file_size      = EXCLUDED.file_size,
+               file_hash      = EXCLUDED.file_hash,
                created_at     = NOW()
          RETURNING *`,
-        [sello_id, tipo, req.file.originalname, r2Key, trimestre, anio, totalReg, req.file.size]
+        [sello_id, tipoFinal, req.file.originalname, r2Key, trimestre, anio, totalReg, req.file.size, fileHash]
       )
       const repId = rep.rows[0].id
 
@@ -161,11 +239,11 @@ router.post('/', requireAdmin, upload.single('file'), async (req, res, next) => 
          ON CONFLICT (sello_id, trimestre, anio) DO UPDATE SET
            total_streaming = CASE WHEN $4 = 'streaming' THEN $5::numeric ELSE resumen_regalias.total_streaming END,
            total_youtube   = CASE WHEN $4 = 'youtube'   THEN $5::numeric ELSE resumen_regalias.total_youtube   END`,
-        [sello_id, trimestre, anio, tipo, totalReg]
+        [sello_id, trimestre, anio, tipoFinal, totalReg]
       )
 
       await client.query('COMMIT')
-      res.status(201).json(rep.rows[0])
+      res.status(201).json({ ...rep.rows[0], tipoCorregido: tipoCorregido ? tipo : null })
     } catch (err) {
       await client.query('ROLLBACK')
       // Try to remove the R2 object we just uploaded
