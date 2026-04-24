@@ -1,5 +1,6 @@
 import express from 'express'
 import cors from 'cors'
+import helmet from 'helmet'
 import dotenv from 'dotenv'
 import authRoutes from './routes/auth.js'
 import sellosRoutes from './routes/sellos.js'
@@ -8,10 +9,15 @@ import portalRoutes from './routes/portal.js'
 
 dotenv.config()
 
+if (!process.env.CORS_ORIGIN) {
+  console.warn('[WARN] CORS_ORIGIN not set — defaulting to localhost:3000. Set CORS_ORIGIN in production.')
+}
+
 const app = express()
 
+app.use(helmet())
 app.use(cors({
-  origin: process.env.CORS_ORIGIN || '*',
+  origin: process.env.CORS_ORIGIN || 'http://localhost:3000',
   credentials: true,
 }))
 app.use(express.json())

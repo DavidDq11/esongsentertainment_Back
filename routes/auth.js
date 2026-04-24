@@ -5,7 +5,27 @@ import pool from '../config/db.js'
 
 const router = Router()
 
-router.post('/login', async (req, res, next) => {
+// Simple in-memory rate limiter: max 10 login attempts per IP per 15 minutes
+const loginAttempts = new Map()
+const LOGIN_WINDOW_MS = 15 * 60 * 1000
+const LOGIN_LIMIT_MAX = 10
+
+function loginRateLimit(req, res, next) {
+  const key = req.ip
+  const now = Date.now()
+  let record = loginAttempts.get(key)
+  if (!record || now > record.resetAt) {
+    record = { count: 0, resetAt: now + LOGIN_WINDOW_MS }
+  }
+  record.count++
+  loginAttempts.set(key, record)
+  if (record.count > LOGIN_LIMIT_MAX) {
+    return res.status(429).json({ error: 'Too many login attempts. Please try again in 15 minutes.' })
+  }
+  next()
+}
+
+router.post('/login', loginRateLimit, async (req, res, next) => {
   try {
     const { email, password } = req.body
     if (!email || !password) {

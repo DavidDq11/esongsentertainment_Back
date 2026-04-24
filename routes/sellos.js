@@ -57,6 +57,7 @@ router.post('/', requireAdmin, async (req, res, next) => {
 router.put('/:id', requireAdmin, async (req, res, next) => {
   try {
     const { nombre, representante, email, pais, telefono, iniciales, estado, password } = req.body
+    const normalizedEmail = email ? email.toLowerCase().trim() : email
     let result
     if (password) {
       const hash = await bcrypt.hash(password, 10)
@@ -66,7 +67,7 @@ router.put('/:id', requireAdmin, async (req, res, next) => {
              iniciales=$6, estado=$7, password_hash=$8
          WHERE id=$9
          RETURNING id, nombre, representante, email, pais, telefono, iniciales, estado`,
-        [nombre, representante, email, pais, telefono, iniciales, estado, hash, req.params.id]
+        [nombre, representante, normalizedEmail, pais, telefono, iniciales, estado, hash, req.params.id]
       )
     } else {
       result = await pool.query(
@@ -75,7 +76,7 @@ router.put('/:id', requireAdmin, async (req, res, next) => {
              iniciales=$6, estado=$7
          WHERE id=$8
          RETURNING id, nombre, representante, email, pais, telefono, iniciales, estado`,
-        [nombre, representante, email, pais, telefono, iniciales, estado, req.params.id]
+        [nombre, representante, normalizedEmail, pais, telefono, iniciales, estado, req.params.id]
       )
     }
     if (!result.rows.length) return res.status(404).json({ error: 'Not found' })
