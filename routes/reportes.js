@@ -22,8 +22,8 @@ const upload = multer({
 
 // Simple in-memory rate limiter for uploads (20 per hour per admin)
 const uploadAttempts = new Map()
-const RATE_WINDOW_MS  = 60 * 60 * 1000 // 1 hour
-const RATE_LIMIT_MAX  = 20
+const RATE_WINDOW_MS = 60 * 60 * 1000 // 1 hour
+const RATE_LIMIT_MAX = 20
 
 function uploadRateLimit(req, res, next) {
   const key = req.user?.id || req.ip
@@ -50,14 +50,14 @@ router.get('/storage', requireAdmin, async (_req, res, next) => {
     const result = await pool.query(
       'SELECT COALESCE(SUM(file_size), 0) AS used, COUNT(*) AS total_files FROM reportes'
     )
-    const usedBytes  = parseInt(result.rows[0].used)
+    const usedBytes = parseInt(result.rows[0].used)
     const totalFiles = parseInt(result.rows[0].total_files)
     res.json({
-      used_bytes:  usedBytes,
+      used_bytes: usedBytes,
       limit_bytes: LIMIT_BYTES,
-      used_gb:     (usedBytes / (1024 ** 3)).toFixed(3),
-      limit_gb:    8,
-      pct:         Math.min(Math.round((usedBytes / LIMIT_BYTES) * 100), 100),
+      used_gb: (usedBytes / (1024 ** 3)).toFixed(3),
+      limit_gb: 8,
+      pct: Math.min(Math.round((usedBytes / LIMIT_BYTES) * 100), 100),
       total_files: totalFiles,
     })
   } catch (err) {
@@ -99,7 +99,7 @@ router.post('/', requireAdmin, uploadRateLimit, upload.single('file'), async (re
     }
 
     // Check storage limit (8 GB)
-    const usedRes  = await pool.query('SELECT COALESCE(SUM(file_size), 0) AS used FROM reportes')
+    const usedRes = await pool.query('SELECT COALESCE(SUM(file_size), 0) AS used FROM reportes')
     const usedBytes = parseInt(usedRes.rows[0].used)
     if (usedBytes + req.file.size > LIMIT_BYTES) {
       const usedGB = (usedBytes / (1024 ** 3)).toFixed(2)
@@ -130,8 +130,8 @@ router.post('/', requireAdmin, uploadRateLimit, upload.single('file'), async (re
       // Auto-detect real file type by column names
       const cols = normalized.length > 0 ? Object.keys(normalized[0]).map(c => c.toLowerCase()) : []
       const looksStreaming = cols.some(c => ['total_earned_usd', 'total_earned', 'streams', 'song_title'].includes(c))
-      const looksYoutube   = cols.some(c => ['total net earnings', 'ad total views', 'asset title'].includes(c))
-      const detectedTipo   = looksYoutube ? 'youtube' : looksStreaming ? 'streaming' : null
+      const looksYoutube = cols.some(c => ['total net earnings', 'ad total views', 'asset title'].includes(c))
+      const detectedTipo = looksYoutube ? 'youtube' : looksStreaming ? 'streaming' : null
 
       if (detectedTipo && detectedTipo !== tipo) {
         tipoFinal = detectedTipo
@@ -140,48 +140,92 @@ router.post('/', requireAdmin, uploadRateLimit, upload.single('file'), async (re
       }
 
       if (tipoFinal === 'streaming') {
-        // Streaming: reporting_month/label/isrc/song_title/artist/streams/total_earned_usd
+        // Streaming: Columna T - PAYABLE TO LABELS
         const map = new Map()
-        for (const row of normalized) {
-          const earnings = parseFloat(row['total_earned_usd'] ?? row['total_earned'] ?? 0) || 0
-          totalReg += earnings
-          const isrc    = String(row['isrc'] ?? row['ISRC'] ?? '')
-          const titulo  = String(row['song_title'] ?? row['title'] ?? 'Track')
-          const artista = String(row['artist'] ?? '')
-          const key     = isrc || titulo
-          if (!map.has(key)) {
-            map.set(key, { titulo, artista, isrc: isrc || null, reproducciones: 0, regalias: 0 })
-          }
-          const entry = map.get(key)
-          entry.reproducciones += parseInt(row['streams'] ?? 0) || 0
-          entry.regalias       += earnings
-        }
-        topSongs = [...map.values()]
-          .sort((a, b) => b.regalias - a.regalias)
-          .slice(0, 10)
-          .map((s, i) => ({ ...s, posicion: i + 1 }))
 
-      } else {
-        // YouTube Content ID: Asset Title/ISRC/Artist/Total Net Earnings/AD Total Views
-        const map = new Map()
         for (const row of normalized) {
-          const earnings = parseFloat(row['Total Net Earnings'] ?? 0) || 0
-          totalReg += earnings
-          const isrc    = String(row['ISRC'] ?? row['Custom ID'] ?? '')
-          const titulo  = String(row['Asset Title'] ?? row['title'] ?? 'Track')
-          const artista = String(row['Artist'] ?? '')
-          const key     = isrc || titulo
+          // 1. Obtener el valor bruto de la columna
+          const rawValue = row['PAYABLE TO LABELS'] ?? row['total_earned_usd'] ?? 0;
+
+          // 2. Limpieza Crítica: Convertir coma a punto y eliminar espacios o símbolos de moneda
+          // Esto asegura que "0,07" se convierta en 0.07 antes de sumar
+          const earnings = typeof rawValue === 'number'
+            ? rawValue
+            : parseFloat(String(rawValue).replace(',', '.').replace(/[^-0.9.]/g, '')) || 0;
+
+          // 3. Validar que no sea una fila vacía (ISRC y Título presentes)
+          const isrc = String(row['isrc'] ?? row['ISRC'] ?? '');
+          const titulo = String(row['song_title'] ?? row['title'] ?? '');
+
+          if (!isrc && !titulo && earnings === 0) continue;
+
+          totalReg += earnings;
+
+          const artista = String(row['artist'] ?? '');
+          const key = isrc || titulo;
+
           if (!map.has(key)) {
-            map.set(key, { titulo, artista, isrc: isrc || null, reproducciones: 0, regalias: 0 })
+            map.set(key, { titulo, artista, isrc: isrc || null, reproducciones: 0, regalias: 0 });
           }
-          const entry = map.get(key)
-          entry.reproducciones += parseInt(row['AD Total Views'] ?? 0) || 0
-          entry.regalias       += earnings
+
+          const entry = map.get(key);
+
+          // Limpieza de reproducciones (evitar errores si vienen con puntos de miles)
+          const streams = typeof row['streams'] === 'number'
+            ? row['streams']
+            : parseInt(String(row['streams'] ?? 0).replace(/\D/g, '')) || 0;
+
+          entry.reproducciones += streams;
+          entry.regalias += earnings;
         }
+
         topSongs = [...map.values()]
           .sort((a, b) => b.regalias - a.regalias)
           .slice(0, 10)
-          .map((s, i) => ({ ...s, posicion: i + 1 }))
+          .map((s, i) => ({ ...s, posicion: i + 1 }));
+      } else {
+        // YouTube: Columna U - Total Net Earnings
+        const map = new Map()
+
+        for (const row of normalized) {
+          // 1. Extraemos los valores clave para validar la fila
+          const assetTitle = String(row['Asset Title'] ?? row['title'] ?? '').toLowerCase();
+          const isrcRaw = String(row['ISRC'] ?? row['Custom ID'] ?? '').toLowerCase();
+
+          // 2. OMITIR FILA DE TOTALES: Si el título contiene "total" o si ambos campos están vacíos
+          if (assetTitle.includes('total') || (assetTitle === '' && isrcRaw === '')) {
+            console.log('[Excel] Saltando fila de resumen/total:', row['Asset Title']);
+            continue;
+          }
+
+          // 3. LIMPIEZA DE NÚMEROS: Convertir "0,0211" -> 0.0211 y quitar símbolos
+          const rawEarnings = row['Total Net Earnings'] ?? 0;
+          const earnings = typeof rawEarnings === 'number'
+            ? rawEarnings
+            : parseFloat(String(rawEarnings).replace(',', '.')) || 0;
+
+          totalReg += earnings;
+
+          const isrc = String(row['ISRC'] ?? row['Custom ID'] ?? '');
+          const titulo = String(row['Asset Title'] ?? row['title'] ?? 'Track');
+          const artista = String(row['Artist'] ?? '');
+          const key = isrc || titulo;
+
+          if (!map.has(key)) {
+            map.set(key, { titulo, artista, isrc: isrc || null, reproducciones: 0, regalias: 0 });
+          }
+          const entry = map.get(key);
+
+          // También limpiamos las reproducciones por si vienen con formato de texto
+          const views = parseInt(String(row['AD Total Views'] ?? 0).replace(/\D/g, '')) || 0;
+          entry.reproducciones += views;
+          entry.regalias += earnings;
+        }
+
+        topSongs = [...map.values()]
+          .sort((a, b) => b.regalias - a.regalias)
+          .slice(0, 10)
+          .map((s, i) => ({ ...s, posicion: i + 1 }));
       }
 
       totalReg = Math.round(totalReg * 100) / 100
@@ -247,7 +291,7 @@ router.post('/', requireAdmin, uploadRateLimit, upload.single('file'), async (re
     } catch (err) {
       await client.query('ROLLBACK')
       // Try to remove the R2 object we just uploaded
-      r2.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: r2Key })).catch(() => {})
+      r2.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: r2Key })).catch(() => { })
       throw err
     } finally {
       client.release()
@@ -265,8 +309,8 @@ router.get('/', requireAuth, async (req, res, next) => {
       const conditions = []
       const { sello_id, tipo, anio } = req.query
       if (sello_id) { params.push(sello_id); conditions.push(`r.sello_id = $${params.length}`) }
-      if (tipo)     { params.push(tipo);     conditions.push(`r.tipo = $${params.length}`) }
-      if (anio)     { params.push(anio);     conditions.push(`r.anio = $${params.length}`) }
+      if (tipo) { params.push(tipo); conditions.push(`r.tipo = $${params.length}`) }
+      if (anio) { params.push(anio); conditions.push(`r.anio = $${params.length}`) }
       const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : ''
       query = `SELECT r.*, s.nombre AS sello_nombre, s.iniciales
                FROM reportes r JOIN sellos s ON s.id = r.sello_id
@@ -314,7 +358,7 @@ router.delete('/:id', requireAdmin, async (req, res, next) => {
     const result = await pool.query('SELECT * FROM reportes WHERE id = $1', [req.params.id])
     if (!result.rows.length) return res.status(404).json({ error: 'Report not found' })
     const report = result.rows[0]
-    r2.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: report.r2_key })).catch(() => {})
+    r2.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: report.r2_key })).catch(() => { })
     await pool.query('DELETE FROM reportes WHERE id = $1', [req.params.id])
     res.json({ ok: true })
   } catch (err) {
