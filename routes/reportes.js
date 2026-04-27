@@ -215,8 +215,9 @@ async function insertReporte(client, { sello_id, tipoFinal, nombre_archivo, r2Ke
 // ---------------------------------------------------------------------------
 // Filename parser for bulk upload
 // Patterns:
-//   Streaming → "2025-12_Discos Relampago_T4Q2.xlsx"  (sello = part after first _)
-//   YouTube   → "4Q-2025 Youtube_Elite Records.xlsx"  (sello = part after "Youtube_")
+//   Streaming → "2025-12_Discos Relampago_T4Q2.xlsx"  (sello = part after first _, año=2025, trimestre=4)
+//   YouTube   → "4Q-2025 Youtube_Elite Records.xlsx"  (sello = part after "Youtube_", trimestre=4, año=2025)
+// Returns { tipo, selloRaw, trimestre?, anio? } — trimestre/anio only if detectable
 // ---------------------------------------------------------------------------
 function parseFilename(filename) {
   const base = filename.replace(/\.xlsx$/i, '')
@@ -224,14 +225,34 @@ function parseFilename(filename) {
   const tipo = isYoutube ? 'youtube' : 'streaming'
 
   let selloRaw = ''
+  let trimestre = null
+  let anio = null
+
   if (isYoutube) {
     // "4Q-2025 Youtube -Elite Records" or "4Q-2025 Youtube_Elite Records"
-    // Strip everything up to and including "youtube" then any spaces/hyphens/underscores
-    const match = base.match(/youtube[\s_-]+(.+)/i)
-    selloRaw = match ? match[1].trim() : ''
+    // Extract trimestre and anio before "Youtube"
+    const match = base.match(/^(\d)Q-(\d{4})\s*Youtube[\s_-]+(.+)/i)
+    if (match) {
+      trimestre = parseInt(match[1], 10)
+      anio = parseInt(match[2], 10)
+      selloRaw = match[3].trim()
+    } else {
+      // Fallback: just sello after Youtube
+      const selloMatch = base.match(/youtube[\s_-]+(.+)/i)
+      selloRaw = selloMatch ? selloMatch[1].trim() : ''
+    }
   } else {
-    // "2025-12_Discos Relampago_T4Q2" → segment between first and second _
-    // Also handles "2025-12 -Discos Relampago" style with space-hyphen separator
+    // Streaming: "2025-12_Discos Relampago_T4Q2"
+    // Extract anio from start, trimestre from end if T#Q# pattern
+    const yearMatch = base.match(/^(\d{4})/)
+    if (yearMatch) {
+      anio = parseInt(yearMatch[1], 10)
+    }
+    const trimMatch = base.match(/T(\d)Q(\d)/i)
+    if (trimMatch) {
+      trimestre = parseInt(trimMatch[1], 10)
+    }
+    // Sello between first _ and second _ or end
     const parts = base.split(/[_]/)
     if (parts.length >= 2) {
       selloRaw = parts[1].trim().replace(/^[-\s]+/, '')
@@ -241,7 +262,7 @@ function parseFilename(filename) {
     }
   }
 
-  return { tipo, selloRaw }
+  return { tipo, selloRaw, trimestre, anio }
 }
 
 // Fuzzy sello match: normalize unicode/case/spaces and check substring containment
@@ -419,15 +440,24 @@ router.post('/bulk', requireAdmin, uploadRateLimit, upload.array('files[]', 30),
       // Validate magic bytes
       const buf = file.buffer
       if (buf[0] !== 0x50 || buf[1] !== 0x4B || buf[2] !== 0x03 || buf[3] !== 0x04) {
-        results.push({ filename, status: 'error', error: 'Not a valid .xlsx file' })
+        results.push({ filename, status: 'error', error: 'No es un archivo .xlsx válido' })
         continue
       }
 
-      // Detect tipo and sello from filename
-      const { tipo, selloRaw } = parseFilename(filename)
+      // Detect tipo, sello, trimestre, anio from filename
+      const { tipo, selloRaw, trimestre: fileTrimestre, anio: fileAnio } = parseFilename(filename)
+      if (fileTrimestre === null || fileAnio === null) {
+        results.push({ filename, status: 'error', tipo, sello_detectado: selloRaw, error: 'No se pudo identificar trimestre y año en el nombre del archivo' })
+        continue
+      }
+      if (fileTrimestre !== trimestreInt || fileAnio !== anioInt) {
+        results.push({ filename, status: 'error', tipo, sello_detectado: selloRaw, error: `El trimestre/año en el nombre del archivo (${fileTrimestre}/${fileAnio}) no coincide con los especificados (${trimestreInt}/${anioInt})` })
+        continue
+      }
+
       const sello = matchSello(selloRaw, sellos)
       if (!sello) {
-        results.push({ filename, status: 'error', tipo, sello_detectado: selloRaw, error: `No matching sello found for "${selloRaw}"` })
+        results.push({ filename, status: 'error', tipo, sello_detectado: selloRaw, error: `No se encontró un sello activo que coincida con "${selloRaw}"` })
         continue
       }
 
