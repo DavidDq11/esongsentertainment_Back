@@ -47,28 +47,6 @@ function uploadRateLimit(req, res, next) {
   next()
 }
 
-// Error handler for multer (file too large, etc)
-function handleMulterError(err, _req, res, next) {
-  if (err instanceof multer.MulterError) {
-    if (err.code === 'LIMIT_FILE_SIZE') {
-      return res.status(400).json({
-        error: 'Uno o más archivos exceden el tamaño máximo permitido (20 MB por archivo)',
-        code: 'FILE_TOO_LARGE',
-        maxSize: '20 MB',
-      })
-    }
-    if (err.code === 'LIMIT_FILE_COUNT') {
-      return res.status(400).json({
-        error: 'Demasiados archivos. El máximo permitido es 30 archivos por carga',
-        code: 'TOO_MANY_FILES',
-        maxFiles: 30,
-      })
-    }
-  }
-  // Pass other errors to next handler
-  next(err)
-}
-
 const LIMIT_BYTES = 8 * 1024 * 1024 * 1024 // 8 GB
 
 // ---------------------------------------------------------------------------
@@ -264,26 +242,16 @@ function parseFilename(filename) {
       selloRaw = selloMatch ? selloMatch[1].trim() : ''
     }
   } else {
-    // Streaming: "2025-12_Discos Relampago.xlsx" or "2025-12_Discos Relampago_T4Q2.xlsx"
-    // Extract anio from start: YYYY
+    // Streaming: "2025-12_Discos Relampago_T4Q2"
+    // Extract anio from start, trimestre from end if T#Q# pattern
     const yearMatch = base.match(/^(\d{4})/)
     if (yearMatch) {
       anio = parseInt(yearMatch[1], 10)
     }
-    
-    // Try to extract month and convert to trimestre: YYYY-MM
-    const monthMatch = base.match(/^(\d{4})-(\d{2})/)
-    if (monthMatch) {
-      const month = parseInt(monthMatch[2], 10)
-      trimestre = Math.ceil(month / 3) // 1-3=Q1, 4-6=Q2, 7-9=Q3, 10-12=Q4
-    }
-    
-    // Also check for explicit T#Q# pattern (optional, for backward compatibility)
     const trimMatch = base.match(/T(\d)Q(\d)/i)
-    if (trimMatch && !trimestre) {
+    if (trimMatch) {
       trimestre = parseInt(trimMatch[1], 10)
     }
-    
     // Sello between first _ and second _ or end
     const parts = base.split(/[_]/)
     if (parts.length >= 2) {
@@ -445,7 +413,7 @@ router.post('/', requireAdmin, uploadRateLimit, upload.single('file'), async (re
 // Returns:
 //   { ok: number, errors: number, results: [{ filename, status, sello, tipo, total_regalias, error? }] }
 // ---------------------------------------------------------------------------
-router.post('/bulk', requireAdmin, uploadRateLimit, upload.array('files[]', 30), handleMulterError, async (req, res, next) => {
+router.post('/bulk', requireAdmin, uploadRateLimit, upload.array('files[]', 30), async (req, res, next) => {
   try {
     const { trimestre, anio } = req.body
     if (!req.files?.length) {
@@ -493,7 +461,7 @@ router.post('/bulk', requireAdmin, uploadRateLimit, upload.array('files[]', 30),
         continue
       }
 
-      // Duplicate check 1: by content hash
+      // Duplicate check by content hash
       const fileHash = createHash('sha256').update(buf).digest('hex')
       const dupCheck = await pool.query(
         `SELECT r.id, r.tipo, r.trimestre, r.anio FROM reportes r WHERE r.file_hash = $1`,
@@ -501,18 +469,7 @@ router.post('/bulk', requireAdmin, uploadRateLimit, upload.array('files[]', 30),
       )
       if (dupCheck.rows.length) {
         const dup = dupCheck.rows[0]
-        results.push({ filename, status: 'skipped', sello: sello.nombre, tipo, error: `Ya existe (duplicado por contenido)` })
-        continue
-      }
-
-      // Duplicate check 2: by sello+tipo+trimestre+anio combination
-      const dupCheck2 = await pool.query(
-        `SELECT r.id FROM reportes r 
-         WHERE r.sello_id = $1 AND r.tipo = $2 AND r.trimestre = $3 AND r.anio = $4`,
-        [sello.id, tipo, trimestreInt, anioInt]
-      )
-      if (dupCheck2.rows.length) {
-        results.push({ filename, status: 'skipped', sello: sello.nombre, tipo, error: `Ya existe (${sello.nombre} · ${tipo} · Q${trimestreInt} ${anioInt})` })
+        results.push({ filename, status: 'skipped', sello: sello.nombre, tipo, error: `Duplicate — already uploaded as Q${dup.trimestre} ${dup.anio} ${dup.tipo}` })
         continue
       }
 
