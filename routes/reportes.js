@@ -242,8 +242,8 @@ function parseFilename(filename) {
       selloRaw = selloMatch ? selloMatch[1].trim() : ''
     }
   } else {
-    // Streaming: "2025-12_Discos Relampago_T4Q2"
-    // Extract anio from start, trimestre from end if T#Q# pattern
+    // Streaming: "2025-12_Discos Relampago_T4Q2" or "2026-01_Oliva Records"
+    // Extract anio from start, trimestre from explicit T#Q# pattern or month if present
     const yearMatch = base.match(/^(\d{4})/)
     if (yearMatch) {
       anio = parseInt(yearMatch[1], 10)
@@ -251,6 +251,14 @@ function parseFilename(filename) {
     const trimMatch = base.match(/T(\d)Q(\d)/i)
     if (trimMatch) {
       trimestre = parseInt(trimMatch[1], 10)
+    } else {
+      const monthMatch = base.match(/^\d{4}-(\d{2})/)
+      if (monthMatch) {
+        const month = parseInt(monthMatch[1], 10)
+        if (month >= 1 && month <= 12) {
+          trimestre = Math.ceil(month / 3)
+        }
+      }
     }
     // Sello between first _ and second _ or end
     const parts = base.split(/[_]/)
