@@ -63,10 +63,8 @@ const LIMIT_BYTES = 8 * 1024 * 1024 * 1024 // 8 GB
 // ---------------------------------------------------------------------------
 // Shared Excel parser — returns { topSongs, totalReg, tipoFinal, tipoCorregido }
 // ---------------------------------------------------------------------------
-function parseExcel(source, tipoHint) {
-  const wb = typeof source === 'string'
-    ? XLSX.readFile(source)
-    : XLSX.read(source, { type: 'buffer' })
+function parseExcel(buffer, tipoHint) {
+  const wb = XLSX.read(buffer, { type: 'buffer' })
   const ws = wb.Sheets[wb.SheetNames[0]]
   const data = XLSX.utils.sheet_to_json(ws)
 
@@ -379,7 +377,7 @@ router.post('/', requireAdmin, uploadRateLimit, upload.single('file'), async (re
 
     // Parse Excel
     let parsed = { topSongs: [], totalReg: 0, tipoFinal: tipo, tipoCorregido: false }
-    try { parsed = parseExcel(filePath, tipo) } catch { /* non-standard format — skip parsing */ }
+    try { parsed = parseExcel(buf, tipo) } catch { /* non-standard format — skip parsing */ }
     const { topSongs, totalReg, tipoFinal, tipoCorregido } = parsed
 
     // Fetch sello name for readable R2 path
@@ -406,7 +404,12 @@ router.post('/', requireAdmin, uploadRateLimit, upload.single('file'), async (re
         fileSize: req.file.size, fileHash, topSongs,
       })
       await client.query('COMMIT')
-      res.status(201).json({ ...row, tipoCorregido: tipoCorregido ? tipo : null })
+      res.status(201).json({
+        ...row,
+        tipoCorregido: tipoCorregido ? tipo : null,
+        total_regalias: totalReg,
+        topSongs,
+      })
     } catch (err) {
       await client.query('ROLLBACK')
       r2.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: r2Key })).catch(() => {})
@@ -500,7 +503,7 @@ router.post('/bulk', requireAdmin, uploadRateLimit, upload.array('files[]', 30),
 
       // Parse Excel
       let parsed = { topSongs: [], totalReg: 0, tipoFinal: tipo, tipoCorregido: false }
-      try { parsed = parseExcel(filePath, tipo) } catch { /* non-standard format */ }
+      try { parsed = parseExcel(buf, tipo) } catch { /* non-standard format */ }
       const { topSongs, totalReg, tipoFinal, tipoCorregido } = parsed
 
       // Upload to R2 — include original filename so each monthly file gets its own path
