@@ -25,7 +25,7 @@ const upload = multer({
   }),
   limits: {
     fileSize: 20 * 1024 * 1024, // 20 MB per file
-    files: 30,                  // max 30 files per request
+    files: 10,                  // max 10 files per request to reduce memory pressure
   },
   fileFilter: (_req, file, cb) => {
     if (file.mimetype.includes('spreadsheet') || file.originalname.endsWith('.xlsx')) {
@@ -63,8 +63,10 @@ const LIMIT_BYTES = 8 * 1024 * 1024 * 1024 // 8 GB
 // ---------------------------------------------------------------------------
 // Shared Excel parser — returns { topSongs, totalReg, tipoFinal, tipoCorregido }
 // ---------------------------------------------------------------------------
-function parseExcel(buffer, tipoHint) {
-  const wb = XLSX.read(buffer, { type: 'buffer' })
+function parseExcel(source, tipoHint) {
+  const wb = typeof source === 'string'
+    ? XLSX.readFile(source)
+    : XLSX.read(source, { type: 'buffer' })
   const ws = wb.Sheets[wb.SheetNames[0]]
   const data = XLSX.utils.sheet_to_json(ws)
 
@@ -377,7 +379,7 @@ router.post('/', requireAdmin, uploadRateLimit, upload.single('file'), async (re
 
     // Parse Excel
     let parsed = { topSongs: [], totalReg: 0, tipoFinal: tipo, tipoCorregido: false }
-    try { parsed = parseExcel(buf, tipo) } catch { /* non-standard format — skip parsing */ }
+    try { parsed = parseExcel(filePath, tipo) } catch { /* non-standard format — skip parsing */ }
     const { topSongs, totalReg, tipoFinal, tipoCorregido } = parsed
 
     // Fetch sello name for readable R2 path
@@ -449,6 +451,17 @@ router.post('/bulk', requireAdmin, uploadRateLimit, upload.array('files[]', 30),
       const filename = file.originalname
       const filePath = file.path
       try {
+        // Duplicate check by filename before reading the entire file
+        const fileDup = await pool.query(
+          `SELECT r.id, r.tipo, r.trimestre, r.anio FROM reportes r WHERE r.nombre_archivo = $1`,
+          [filename]
+        )
+        if (fileDup.rows.length) {
+          const dup = fileDup.rows[0]
+          results.push({ filename, status: 'skipped', error: `Duplicate — already uploaded as Q${dup.trimestre} ${dup.anio} ${dup.tipo}` })
+          continue
+        }
+
         // Validate magic bytes
         const buf = await fs.promises.readFile(filePath)
         if (buf[0] !== 0x50 || buf[1] !== 0x4B || buf[2] !== 0x03 || buf[3] !== 0x04) {
@@ -456,7 +469,7 @@ router.post('/bulk', requireAdmin, uploadRateLimit, upload.array('files[]', 30),
           continue
         }
 
-      // Detect tipo, sello, trimestre, anio from filename
+        // Detect tipo, sello, trimestre, anio from filename
       const { tipo, selloRaw, trimestre: fileTrimestre, anio: fileAnio } = parseFilename(filename)
       if (fileTrimestre === null || fileAnio === null) {
         results.push({ filename, status: 'error', tipo, sello_detectado: selloRaw, error: 'No se pudo identificar trimestre y año en el nombre del archivo' })
@@ -487,7 +500,7 @@ router.post('/bulk', requireAdmin, uploadRateLimit, upload.array('files[]', 30),
 
       // Parse Excel
       let parsed = { topSongs: [], totalReg: 0, tipoFinal: tipo, tipoCorregido: false }
-      try { parsed = parseExcel(buf, tipo) } catch { /* non-standard format */ }
+      try { parsed = parseExcel(filePath, tipo) } catch { /* non-standard format */ }
       const { topSongs, totalReg, tipoFinal, tipoCorregido } = parsed
 
       // Upload to R2 — include original filename so each monthly file gets its own path
