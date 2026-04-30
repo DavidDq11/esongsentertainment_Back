@@ -25,7 +25,7 @@ function loginRateLimit(req, res, next) {
   next()
 }
 
-router.post('/login', loginRateLimit, async (req, res, next) => {
+router.post('/login', async (req, res, next) => {
   try {
     const { email, password } = req.body
     if (!email || !password) {

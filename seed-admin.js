@@ -4,9 +4,9 @@ import dotenv from 'dotenv'
 
 dotenv.config()
 
-const nombre   = 'Administrador'
-const email    = 'admin@esongs.com'   // <-- cambia esto
-const password = 'admin123'           // <-- cambia esto
+const nombre   = 'Rosemary'  // <-- cambia esto
+const email    = 'rosemary@esongs.com'   // <-- cambia esto
+const password = 'EsongsEntertainment2026*'           // <-- cambia esto
 
 const hash = await bcrypt.hash(password, 10)
 
