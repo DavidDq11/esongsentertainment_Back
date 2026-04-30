@@ -148,7 +148,7 @@ function parseExcel(buffer, tipoHint) {
 
 // ---------------------------------------------------------------------------
 // Insert a parsed report into DB within an existing client transaction.
-// upsert=true  → ON CONFLICT (sello_id, tipo, trimestre, anio) DO UPDATE  (single upload)
+// upsert=true  → ON CONFLICT (r2_key) DO UPDATE  (single upload uses same R2 path)
 // upsert=false → plain INSERT, allows multiple rows per quarter            (bulk streaming)
 // ---------------------------------------------------------------------------
 async function insertReporte(client, { sello_id, tipoFinal, nombre_archivo, r2Key, trimestre, anio, totalReg, fileSize, fileHash, topSongs, upsert = true }) {
@@ -157,9 +157,8 @@ async function insertReporte(client, { sello_id, tipoFinal, nombre_archivo, r2Ke
     rep = await client.query(
       `INSERT INTO reportes (sello_id, tipo, nombre_archivo, r2_key, trimestre, anio, total_regalias, file_size, file_hash)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-       ON CONFLICT (sello_id, tipo, trimestre, anio) DO UPDATE
+       ON CONFLICT (r2_key) DO UPDATE
          SET nombre_archivo = EXCLUDED.nombre_archivo,
-             r2_key         = EXCLUDED.r2_key,
              total_regalias = EXCLUDED.total_regalias,
              file_size      = EXCLUDED.file_size,
              file_hash      = EXCLUDED.file_hash,
@@ -338,13 +337,13 @@ router.post('/', requireAdmin, uploadRateLimit, upload.single('file'), async (re
       return res.status(400).json({ error: 'Invalid file. The file is not a valid .xlsx document.' })
     }
 
-    // Check for duplicate file by content hash
+    // Check for duplicate file by filename
     const fileHash = createHash('sha256').update(buf).digest('hex')
     const dupCheck = await pool.query(
       `SELECT r.id, r.tipo, r.trimestre, r.anio, s.nombre AS sello_nombre
        FROM reportes r JOIN sellos s ON s.id = r.sello_id
-       WHERE r.file_hash = $1`,
-      [fileHash]
+       WHERE r.nombre_archivo = $1`,
+      [req.file.originalname]
     )
     if (dupCheck.rows.length) {
       const dup = dupCheck.rows[0]
@@ -469,11 +468,11 @@ router.post('/bulk', requireAdmin, uploadRateLimit, upload.array('files[]', 30),
         continue
       }
 
-      // Duplicate check by content hash
+      // Duplicate check by filename
       const fileHash = createHash('sha256').update(buf).digest('hex')
       const dupCheck = await pool.query(
-        `SELECT r.id, r.tipo, r.trimestre, r.anio FROM reportes r WHERE r.file_hash = $1`,
-        [fileHash]
+        `SELECT r.id, r.tipo, r.trimestre, r.anio FROM reportes r WHERE r.nombre_archivo = $1`,
+        [filename]
       )
       if (dupCheck.rows.length) {
         const dup = dupCheck.rows[0]
