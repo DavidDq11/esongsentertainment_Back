@@ -1,4 +1,6 @@
 import { Router } from 'express'
+import fs from 'fs'
+import path from 'path'
 import { createHash } from 'crypto'
 import multer from 'multer'
 import { PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3'
@@ -8,10 +10,19 @@ import pool from '../config/db.js'
 import { r2, R2_BUCKET } from '../config/r2.js'
 import { requireAdmin, requireAuth } from '../middleware/auth.js'
 
+const uploadDir = path.resolve('uploads')
+fs.mkdirSync(uploadDir, { recursive: true })
+
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 const upload = multer({
-  storage: multer.memoryStorage(),
+  storage: multer.diskStorage({
+    destination: uploadDir,
+    filename: (_req, file, cb) => {
+      const safeName = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_')
+      cb(null, `${Date.now()}-${safeName}`)
+    },
+  }),
   limits: {
     fileSize: 20 * 1024 * 1024, // 20 MB per file
     files: 30,                  // max 30 files per request
@@ -311,6 +322,7 @@ router.get('/storage', requireAdmin, async (_req, res, next) => {
 // Upload report (admin only) — single file with R2 storage
 // ---------------------------------------------------------------------------
 router.post('/', requireAdmin, uploadRateLimit, upload.single('file'), async (req, res, next) => {
+  const filePath = req.file?.path
   try {
     const { sello_id, tipo, trimestre, anio } = req.body
     if (!req.file || !sello_id || !tipo || !trimestre || !anio) {
@@ -331,8 +343,8 @@ router.post('/', requireAdmin, uploadRateLimit, upload.single('file'), async (re
       return res.status(400).json({ error: 'anio must be a valid year' })
     }
 
-    // Validate magic bytes: XLSX files are ZIP archives starting with PK\x03\x04
-    const buf = req.file.buffer
+    // Read the uploaded file from disk instead of memory
+    const buf = await fs.promises.readFile(filePath)
     if (buf[0] !== 0x50 || buf[1] !== 0x4B || buf[2] !== 0x03 || buf[3] !== 0x04) {
       return res.status(400).json({ error: 'Invalid file. The file is not a valid .xlsx document.' })
     }
@@ -402,23 +414,15 @@ router.post('/', requireAdmin, uploadRateLimit, upload.single('file'), async (re
     }
   } catch (err) {
     next(err)
+  } finally {
+    if (filePath) {
+      await fs.promises.unlink(filePath).catch(() => {})
+    }
   }
 })
 
 // ---------------------------------------------------------------------------
 // Bulk upload (admin only) — multiple files, no R2, sello detected from filename
-//
-// Body (multipart/form-data):
-//   files[]   — up to 30 .xlsx files
-//   trimestre — 1-4
-//   anio      — e.g. 2025
-//
-// The sello is inferred from each filename:
-//   Streaming: "2025-12_{Sello Name}_*.xlsx"
-//   YouTube:   "*Youtube_{Sello Name}.xlsx"
-//
-// Returns:
-//   { ok: number, errors: number, results: [{ filename, status, sello, tipo, total_regalias, error? }] }
 // ---------------------------------------------------------------------------
 router.post('/bulk', requireAdmin, uploadRateLimit, upload.array('files[]', 30), async (req, res, next) => {
   try {
@@ -443,13 +447,14 @@ router.post('/bulk', requireAdmin, uploadRateLimit, upload.array('files[]', 30),
 
     for (const file of req.files) {
       const filename = file.originalname
-
-      // Validate magic bytes
-      const buf = file.buffer
-      if (buf[0] !== 0x50 || buf[1] !== 0x4B || buf[2] !== 0x03 || buf[3] !== 0x04) {
-        results.push({ filename, status: 'error', error: 'No es un archivo .xlsx válido' })
-        continue
-      }
+      const filePath = file.path
+      try {
+        // Validate magic bytes
+        const buf = await fs.promises.readFile(filePath)
+        if (buf[0] !== 0x50 || buf[1] !== 0x4B || buf[2] !== 0x03 || buf[3] !== 0x04) {
+          results.push({ filename, status: 'error', error: 'No es un archivo .xlsx válido' })
+          continue
+        }
 
       // Detect tipo, sello, trimestre, anio from filename
       const { tipo, selloRaw, trimestre: fileTrimestre, anio: fileAnio } = parseFilename(filename)
@@ -499,6 +504,7 @@ router.post('/bulk', requireAdmin, uploadRateLimit, upload.array('files[]', 30),
         }))
       } catch (r2Err) {
         results.push({ filename, status: 'error', sello: sello.nombre, tipo: tipoFinal, error: `R2 upload failed: ${r2Err.message}` })
+        await fs.promises.unlink(filePath).catch(() => {})
         continue
       }
 
@@ -527,6 +533,9 @@ router.post('/bulk', requireAdmin, uploadRateLimit, upload.array('files[]', 30),
         results.push({ filename, status: 'error', sello: sello.nombre, tipo: tipoFinal, error: err.message })
       } finally {
         client.release()
+      }
+      } finally {
+        await fs.promises.unlink(filePath).catch(() => {})
       }
     }
 
