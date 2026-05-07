@@ -35,15 +35,24 @@ router.get('/dashboard', requireSello, async (req, res, next) => {
       anio:      periodo?.anio      ?? null,
     }
 
-    // Top 5 songs from reports within that same period (both streaming and youtube)
+    // Last uploaded report in that period (any type) — used for top songs + metadata
+    const lastReporteRes = await pool.query(
+      `SELECT id, nombre_archivo, tipo FROM reportes
+       WHERE sello_id = $1 AND anio = $2 AND trimestre = $3
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [selloId, periodo?.anio ?? 0, periodo?.trimestre ?? 0]
+    )
+    const lastReporte = lastReporteRes.rows[0] || null
+
+    // Top 5 songs from that last report
     const topRes = await pool.query(
       `SELECT tc.titulo, tc.artista, tc.reproducciones, tc.regalias, tc.posicion
        FROM top_canciones tc
-       JOIN reportes r ON r.id = tc.reporte_id
-       WHERE r.sello_id = $1 AND r.anio = $2 AND r.trimestre = $3
-       ORDER BY tc.regalias DESC
+       WHERE tc.reporte_id = $1
+       ORDER BY tc.posicion ASC
        LIMIT 5`,
-      [selloId, periodo?.anio ?? 0, periodo?.trimestre ?? 0]
+      [lastReporte?.id ?? 0]
     )
 
     // Compute percentages relative to max
@@ -71,6 +80,8 @@ router.get('/dashboard', requireSello, async (req, res, next) => {
         total: streaming + youtube,
         trimestre: resumen.trimestre,
         anio: resumen.anio,
+        nombre_archivo: lastReporte?.nombre_archivo ?? null,
+        tipo_top: lastReporte?.tipo ?? null,
       },
       topSongs,
     })
