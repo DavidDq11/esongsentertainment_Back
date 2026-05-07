@@ -178,7 +178,7 @@ function parseExcel(buffer, tipoHint) {
 
   const topSongs = [...map.values()]
     .sort((a, b) => b.regalias - a.regalias)
-    .slice(0, 10)
+    .slice(0, 5)
     .map((s, i) => ({ ...s, posicion: i + 1 }))
 
   totalReg = Math.round(totalReg * 100) / 100
